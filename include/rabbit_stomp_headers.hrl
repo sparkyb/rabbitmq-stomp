@@ -19,6 +19,7 @@
 -define(HEADER_AMQP_MESSAGE_ID, "amqp-message-id").
 -define(HEADER_APP_ID, "app-id").
 -define(HEADER_AUTO_DELETE, "auto-delete").
+-define(HEADER_BINDINGS, "bindings").
 -define(HEADER_CONTENT_ENCODING, "content-encoding").
 -define(HEADER_CONTENT_LENGTH, "content-length").
 -define(HEADER_CONTENT_TYPE, "content-type").

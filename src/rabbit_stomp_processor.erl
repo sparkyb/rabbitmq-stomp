@@ -693,7 +693,24 @@ do_subscribe(Destination, DestHdr, Frame,
                                                   arguments    = []},
                                                self()),
                         ok = rabbit_routing_util:ensure_binding(
-                               Queue, ExchangeAndKey, Channel)
+                               Queue, ExchangeAndKey, Channel),
+                        Bindings = case rabbit_stomp_frame:header(Frame,
+                                ?HEADER_BINDINGS) of
+                            {ok, Value} -> re:split(Value, ",",
+                                                    [{return, list}]);
+                            not_found -> []
+                        end,
+                        lists:foreach(fun(Binding) ->
+                               {ok, BindingDest} =
+                                   rabbit_routing_util:parse_endpoint(
+                                       string:strip(Binding)),
+                               ok = rabbit_routing_util:ensure_binding(
+                                   Queue,
+                                   parse_routing(BindingDest,
+                                                 DfltTopicEx),
+                                   Channel)
+                            end, Bindings)
+
                     catch exit:Err ->
                             %% it's safe to delete this queue, it
                             %% was server-named and declared by us
