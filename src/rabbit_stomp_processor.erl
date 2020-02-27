@@ -33,7 +33,7 @@
 
 -record(proc_state, {session_id, channel, connection, subscriptions,
                 version, start_heartbeat_fun, pending_receipts,
-                config, route_state, reply_queues, frame_transformer,
+                config, route_state, temp_queues, frame_transformer,
                 adapter_info, send_fun, ssl_login_name, peer_addr,
                 %% see rabbitmq/rabbitmq-stomp#39
                 trailing_lf, auth_mechanism, auth_login,
@@ -160,7 +160,7 @@ initial_state(Configuration,
        pending_receipts    = undefined,
        config              = Configuration,
        route_state         = rabbit_routing_util:init_state(),
-       reply_queues        = #{},
+       temp_queues         = #{},
        frame_transformer   = undefined,
        trailing_lf         = application:get_env(rabbitmq_stomp, trailing_lf, true),
        default_topic_exchange = application:get_env(rabbitmq_stomp, default_topic_exchange, <<"amq.topic">>)}.
@@ -656,7 +656,6 @@ server_header() ->
 
 do_subscribe(Destination, DestHdr, Frame,
              State = #proc_state{subscriptions = Subs,
-                                 route_state   = RouteState,
                                  channel       = Channel,
                                  default_topic_exchange = DfltTopicEx}) ->
     check_subscription_access(Destination, State),
@@ -664,8 +663,8 @@ do_subscribe(Destination, DestHdr, Frame,
         rabbit_stomp_frame:integer_header(Frame, ?HEADER_PREFETCH_COUNT,
                                           undefined),
     {AckMode, IsMulti} = rabbit_stomp_util:ack_mode(Frame),
-    case ensure_endpoint(source, Destination, Frame, Channel, RouteState) of
-        {ok, Queue, RouteState1} ->
+    case ensure_endpoint(source, Destination, Frame, State) of
+        {ok, Queue, State1} ->
             {ok, ConsumerTag, Description} =
                 rabbit_stomp_util:consumer_tag(Frame),
             case Prefetch of
@@ -677,11 +676,11 @@ do_subscribe(Destination, DestHdr, Frame,
                 {ok, _} ->
                     Message = "Duplicated subscription identifier",
                     Detail = "A subscription identified by '~s' already exists.",
-                    _ = error(Message, Detail, [ConsumerTag], State),
-                    _ = send_error(Message, Detail, [ConsumerTag], State),
-                    {stop, normal, close_connection(State)};
+                    _ = error(Message, Detail, [ConsumerTag], State1),
+                    _ = send_error(Message, Detail, [ConsumerTag], State1),
+                    {stop, normal, close_connection(State1)};
                 error ->
-                    ExchangeAndKey = parse_routing(Destination, DfltTopicEx),
+                    ExchangeAndKey = parse_routing(Destination, DfltTopicEx, Queue),
                     try
                         amqp_channel:subscribe(Channel,
                                                #'basic.consume'{
@@ -699,23 +698,22 @@ do_subscribe(Destination, DestHdr, Frame,
                             %% was server-named and declared by us
                             case Destination of
                                 {exchange, _} ->
-                                    ok = maybe_clean_up_queue(Queue, State);
+                                    ok = maybe_clean_up_queue(Queue, State1);
                                 {topic, _} ->
-                                    ok = maybe_clean_up_queue(Queue, State);
+                                    ok = maybe_clean_up_queue(Queue, State1);
                                 _ ->
                                     ok
                             end,
                             exit(Err)
                     end,
-                    ok(State#proc_state{subscriptions =
+                    ok(State1#proc_state{subscriptions =
                                        maps:put(
                                          ConsumerTag,
                                          #subscription{dest_hdr    = DestHdr,
                                                        ack_mode    = AckMode,
                                                        multi_ack   = IsMulti,
                                                        description = Description},
-                                         Subs),
-                                   route_state = RouteState1})
+                                         Subs)})
             end;
         {error, _} = Err ->
             Err
@@ -747,19 +745,17 @@ maybe_clean_up_queue(Queue, #proc_state{connection = Connection}) ->
 
 do_send(Destination, _DestHdr,
         Frame = #stomp_frame{body_iolist = BodyFragments},
-        State = #proc_state{channel = Channel,
-                            route_state = RouteState,
-                            default_topic_exchange = DfltTopicEx}) ->
-    case ensure_endpoint(dest, Destination, Frame, Channel, RouteState) of
+        State = #proc_state{default_topic_exchange = DfltTopicEx}) ->
+    case ensure_endpoint(dest, Destination, Frame, State) of
 
-        {ok, _Q, RouteState1} ->
+        {ok, Queue, State1} ->
 
-            {Frame1, State1} =
-                ensure_reply_to(Frame, State#proc_state{route_state = RouteState1}),
+            {Frame1, State2} =
+                ensure_reply_to(Frame, State1),
 
             Props = rabbit_stomp_util:message_properties(Frame1),
 
-            {Exchange, RoutingKey} = parse_routing(Destination, DfltTopicEx),
+            {Exchange, RoutingKey} = parse_routing(Destination, DfltTopicEx, Queue),
 
             Method = #'basic.publish'{
               exchange = list_to_binary(Exchange),
@@ -775,10 +771,10 @@ do_send(Destination, _DestHdr,
                               maybe_record_receipt(Frame1, StateN)
                       end,
                       {Method, Props, BodyFragments},
-                      State1);
+                      State2);
                 no ->
                     ok(send_method(Method, Props, BodyFragments,
-                                   maybe_record_receipt(Frame1, State1)))
+                                   maybe_record_receipt(Frame1, State2)))
             end;
 
         {error, _} = Err ->
@@ -886,17 +882,31 @@ ensure_reply_to(Frame = #stomp_frame{headers = Headers}, State) ->
             end
     end.
 
-ensure_reply_queue(TempQueueId, State = #proc_state{channel       = Channel,
-                                               reply_queues  = RQS,
-                                               subscriptions = Subs}) ->
-    case maps:find(TempQueueId, RQS) of
-        {ok, RQ} ->
-            {binary_to_list(RQ), State};
+ensure_temp_queue(TempQueueId, State = #proc_state{channel = Channel,
+                                                   temp_queues = TQS}) ->
+    case maps:find(TempQueueId, TQS) of
+        {ok, Queue} ->
+            {binary_to_list(Queue), State};
         error ->
             #'queue.declare_ok'{queue = Queue} =
                 amqp_channel:call(Channel,
                                   #'queue.declare'{auto_delete = true,
                                                    exclusive   = true}),
+            {binary_to_list(Queue), State#proc_state{
+                            temp_queues  = maps:put(TempQueueId, Queue, TQS)}}
+    end.
+
+
+ensure_reply_queue(TempQueueId, State = #proc_state{channel       = Channel,
+                                               temp_queues  = TQS,
+                                               subscriptions = Subs}) ->
+    case maps:find(TempQueueId, TQS) of
+        {ok, Queue} ->
+            {binary_to_list(Queue), State};
+        error ->
+            {Destination, State1} = ensure_temp_queue(TempQueueId, State),
+
+            Queue = list_to_binary(Destination),
 
             ConsumerTag = rabbit_stomp_util:consumer_tag_reply_to(TempQueueId),
             #'basic.consume_ok'{} =
@@ -908,16 +918,13 @@ ensure_reply_queue(TempQueueId, State = #proc_state{channel       = Channel,
                                          nowait       = false},
                                        self()),
 
-            Destination = binary_to_list(Queue),
-
             %% synthesise a subscription to the reply queue destination
             Subs1 = maps:put(ConsumerTag,
                              #subscription{dest_hdr  = Destination,
                                            multi_ack = false},
                              Subs),
 
-            {Destination, State#proc_state{
-                            reply_queues  = maps:put(TempQueueId, Queue, RQS),
+            {Destination, State1#proc_state{
                             subscriptions = Subs1}}
     end.
 
@@ -1085,10 +1092,16 @@ millis_to_seconds(M)               -> M div 1000.
 %% Queue Setup
 %%----------------------------------------------------------------------------
 
-ensure_endpoint(_Direction, {queue, []}, _Frame, _Channel, _State) ->
+ensure_endpoint(_Direction, {queue, []}, _Frame, _State) ->
     {error, {invalid_destination, "Destination cannot be blank"}};
 
-ensure_endpoint(source, EndPoint, {_, _, Headers, _} = Frame, Channel, State) ->
+ensure_endpoint(_Direction, {temp_queue, TempQueueId}, _Frame, State) ->
+    {Queue, State1} = ensure_temp_queue(TempQueueId, State),
+    {ok, list_to_binary(Queue), State1};
+
+ensure_endpoint(source, EndPoint, {_, _, Headers, _} = Frame,
+                State = #proc_state{channel       = Channel,
+                                    route_state = RouteState}) ->
     Params =
         [{subscription_queue_name_gen,
           fun () ->
@@ -1100,14 +1113,20 @@ ensure_endpoint(source, EndPoint, {_, _, Headers, _} = Frame, Channel, State) ->
           end
          }] ++ rabbit_stomp_util:build_params(EndPoint, Headers),
     Arguments = rabbit_stomp_util:build_arguments(Headers),
-    rabbit_routing_util:ensure_endpoint(source, Channel, EndPoint,
-                                        [Arguments | Params], State);
+    {ok, Queue, RouteState1} =
+        rabbit_routing_util:ensure_endpoint(source, Channel, EndPoint,
+                                            [Arguments | Params], RouteState),
+    {ok, Queue, State#proc_state{route_state = RouteState1}};
 
-ensure_endpoint(Direction, EndPoint, {_, _, Headers, _}, Channel, State) ->
+ensure_endpoint(Direction, EndPoint, {_, _, Headers, _},
+                State = #proc_state{channel       = Channel,
+                                    route_state = RouteState}) ->
     Params = rabbit_stomp_util:build_params(EndPoint, Headers),
     Arguments = rabbit_stomp_util:build_arguments(Headers),
-    rabbit_routing_util:ensure_endpoint(Direction, Channel, EndPoint,
-                                        [Arguments | Params], State).
+    {ok, Queue, RouteState1} =
+        rabbit_routing_util:ensure_endpoint(Direction, Channel, EndPoint,
+                                            [Arguments | Params], RouteState),
+    {ok, Queue, State#proc_state{route_state = RouteState1}}.
 
 build_subscription_id(Frame) ->
     case rabbit_stomp_util:has_durable_header(Frame) of
@@ -1199,6 +1218,12 @@ additional_info(Key,
     proplists:get_value(Key, AddInfo).
 
 parse_routing(Destination, DefaultTopicExchange) ->
+    parse_routing(Destination, DefaultTopicExchange, undefined).
+
+parse_routing({temp_queue, _}, _, Queue) ->
+    {"", binary_to_list(Queue)};
+
+parse_routing(Destination, DefaultTopicExchange, _) ->
     {Exchange0, RoutingKey} = rabbit_routing_util:parse_routing(Destination),
     Exchange1 = maybe_apply_default_topic_exchange(Exchange0, DefaultTopicExchange),
     {Exchange1, RoutingKey}.
